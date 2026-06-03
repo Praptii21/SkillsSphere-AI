@@ -26,6 +26,12 @@ export async function runPipeline({
   const _safeEval = (name, fn, fallback) => safeEval(name, fn, validateEvaluatorResult, fallback);
 
   function parseExperience(experience = []) {
+    if (typeof experience === "string") {
+      return experience;
+    }
+    if (!Array.isArray(experience)) {
+      return "";
+    }
     return experience
       .map((entry) => {
         if (typeof entry === "string") return entry;
