@@ -146,14 +146,54 @@ app.use((req, res, next) => {
 // Apply global rate limiting to all /api routes
 app.use("/api", globalLimiter);
 
-await connectDB();
-await connectRedis();
+// Safe startup: MongoDB/Redis may be temporarily unavailable.
+// Keep server running in degraded mode instead of crashing the process.
+let didConnectRedis = false;
+try {
+  await connectDB();
+  
+  // Clear ghost sockets from active classroom sessions on server startup to prevent WebRTC continuity issues
+  const ClassroomSession = (await import("./src/database/models/ClassroomSession.js")).default;
+  const resetResult = await ClassroomSession.updateMany(
+    { status: "active" },
+    { $set: { participants: [] } }
+  );
+  if (resetResult.modifiedCount > 0) {
+    logger.log(`Cleared ghost participants from ${resetResult.modifiedCount} active classroom(s)`);
+  }
+} catch (err) {
+  logger.error(
+    "MongoDB startup error (degraded mode):",
+    err instanceof Error ? err.message : err,
+  );
+}
+
+try {
+  await connectRedis();
+  didConnectRedis = true;
+} catch (err) {
+  logger.error(
+    "Redis startup error (degraded mode):",
+    err instanceof Error ? err.message : err,
+  );
+}
+
+// Expose a simple readiness signal for /health without relying on redisClient internals.
+globalThis.__REDIS_READY__ = didConnectRedis;
+
 logEvaluatorConfig();
+
+
 
 // Initialize Gemini AI client logic moved to src/modules/ai-assistant/controller.js
 
 app.get("/health", (req, res) => {
-  res.json({ status: "OK", db: isConnected ? "connected" : "disconnected" });
+  res.json({
+    status: "OK",
+    db: isConnected ? "connected" : "disconnected",
+    redis: globalThis.__REDIS_READY__ ? "connected" : "disconnected",
+
+  });
 });
 
 // app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -212,10 +252,23 @@ initRoadmapSockets(io);
 // Catch-all 404 handler for API routes
 // This prevents Express from returning HTML on missing routes, which crashes frontend JSON parsers.
 app.use("/api/*", (req, res) => {
-  res.status(404).json({ success: false, message: `API route not found: ${req.method} ${req.originalUrl}` });
+  res.status(404).json({
+    success: false,
+    message: `API route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Global 404 JSON handler for non-API routes.
+// Prevents Express from returning HTML for unknown routes which may break JSON-based frontend calls.
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
 });
 
 app.use(globalErrorHandler);
+
 
 server.listen(PORT, () => {
   logger.log(`Server running on http://localhost:${PORT}`);

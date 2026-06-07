@@ -8,23 +8,74 @@ const handleCastErrorDB = (err) => {
 };
 
 const handleDuplicateFieldsDB = (err) => {
-  const raw = err.errmsg || err.message || "";
-  const match = raw.match(/(["'])(\\?.)*?\1/);
-  const value = match ? match[0] : "unknown";
+  // MongoDB duplicate key errors usually look like:
+  // - err.code === 11000
+  // - message includes: "dup key: { <field>: \"<value>\" }"
+  // - and may also include: err.keyValue === { <field>: <value> }
+
+  // Preferred: keyValue (works regardless of MongoDB version / message format)
+  if (err?.keyValue && typeof err.keyValue === "object") {
+    const keys = Object.keys(err.keyValue);
+    if (keys.length > 0) {
+      const firstKey = keys[0];
+      const rawValue = err.keyValue[firstKey];
+      const value =
+        rawValue === null || rawValue === undefined
+          ? "unknown"
+          : String(rawValue).replace(/^['"]|['"]$/g, "");
+
+      const message = `Duplicate field value: ${value}. Please use another value!`;
+      return new AppError(message, 400);
+    }
+  }
+
+  // Fallback: parse message "dup key: { ...: \"VALUE\" }"
+  const raw = err?.errmsg || err?.message || "";
+
+  // Capture either a quoted string or a number-like value inside the dup key object.
+  // Example: dup key: { email: "a@b.com" }
+  const match = raw.match(/dup key:\s*\{[^}]*:\s*(?:"([^"]*)"|'([^']*)'|([^\s}]+))\s*\}/i);
+
+  const value = match
+    ? String(match[1] || match[2] || match[3] || "unknown").trim()
+    : "unknown";
+
   const message = `Duplicate field value: ${value}. Please use another value!`;
   return new AppError(message, 400);
 };
 
 const handleValidationErrorDB = (err) => {
-  // Build field-level errors object for frontend consumption
+  // Build field-level errors object for frontend consumption.
+  // Hardened: Mongoose ValidationError should have `err.errors`,
+  // but some callers/mocked errors may pass it as undefined or non-object.
+  const rawErrors = err?.errors;
+
+  if (!rawErrors || typeof rawErrors !== "object") {
+    const message = "Invalid input data.";
+    const error = new AppError(message, 400);
+    error.errors = {};
+    return error;
+  }
+
   const errors = {};
-  Object.keys(err.errors).forEach((key) => {
-    errors[key] = err.errors[key].message;
+  Object.keys(rawErrors).forEach((key) => {
+    const fieldErr = rawErrors[key];
+    errors[key] = fieldErr?.message || "Invalid value";
   });
-  
-  const messages = Object.values(err.errors).map((el) => el.message);
-  const message = `Invalid input data. ${messages.join(". ")}`;
-  
+
+  const messages = Object.values(rawErrors)
+    .map((el) => el?.message)
+    .filter((m) => typeof m === "string" && m.trim().length > 0)
+    .map((m) => m.trim())
+    // Normalize punctuation to avoid odd sequences like "...invalid.. other".
+    // Keep the join delimiter consistent instead.
+    .map((m) => m.replace(/[.!?]+\s*$/u, ""));
+
+  const message = messages.length
+    ? `Invalid input data. ${messages.join(". ")}.`
+    : "Invalid input data.";
+
+
   const error = new AppError(message, 400);
   error.errors = errors; // Attach field-level errors
   return error;
@@ -133,17 +184,56 @@ const globalErrorHandler = (err, req, res, next) => {
   if (error.code === 11000) error = handleDuplicateFieldsDB(error);
   if (error.name === "ValidationError") error = handleValidationErrorDB(error);
   
-  // Handle AI errors (Axios/OpenAI-like + Gemini/Google Generative AI)
+  // Handle AI errors (Gemini/Google Generative AI + AI-specific Axios errors)
+  // IMPORTANT: Do NOT classify AI errors solely by message text (e.g. "google"),
+  // otherwise non-AI operational errors containing these words get misclassified.
+  //
+  // IMPORTANT FIX: Do NOT classify all Axios errors as AI.
+  // `error.isAxiosError === true` can be true for operational failures to non-AI upstream services.
+  const url = typeof error?.config?.url === "string" ? error.config.url : "";
+  const aiUrlHints = [
+    // Google / Gemini endpoints (best-effort allowlist)
+    "generativelanguage.googleapis.com",
+    "googleapis.com",
+    "/v1beta/",
+    "/v1/",
+    // Some SDKs/clients may use a custom base URL that still includes these hints.
+    "gemini",
+    "generative",
+    // OpenAI (if used elsewhere in the app)
+    "api.openai.com",
+    "chat/completions",
+    "responses",
+  ];
+  const isAiAxiosError = Boolean(
+    error.isAxiosError &&
+      (aiUrlHints.some((hint) => url.toLowerCase().includes(hint)) ||
+        // Secondary check: provider header / type hints if present.
+        (typeof error?.config?.headers === "object" &&
+          (Object.values(error.config.headers)
+            .filter((v) => typeof v === "string")
+            .join(" ")
+            .toLowerCase()
+            .includes("google") ||
+            Object.values(error.config.headers)
+              .filter((v) => typeof v === "string")
+              .join(" ")
+              .toLowerCase()
+              .includes("gemini"))))
+  );
+
   if (
-    error.isAxiosError ||
+    isAiAxiosError ||
     error.type === "invalid_request_error" ||
     error?.name === "GoogleGenerativeAI" ||
     error?.provider === "google" ||
-    (typeof error?.status === 'number') ||
-    /gemini|generative ai|google/i.test(String(error?.message || ""))
+    (typeof error?.status === "number" &&
+      // Gate status-based heuristics behind known AI/provider identifiers.
+      (error?.name === "GoogleGenerativeAI" || error?.provider === "google"))
   ) {
     error = handleAIError(error);
   }
+
 
   
   // Preserve field-level errors from Mongoose if present (deterministic)
@@ -180,6 +270,7 @@ const globalErrorHandler = (err, req, res, next) => {
       res.status(error.statusCode).json({
         success: false,
         status: error.status,
+        statusCode: error.statusCode,
         message: error.message,
         errors: error.errors || {}, // Include field-level errors if available
       });
